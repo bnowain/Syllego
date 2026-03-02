@@ -140,15 +140,62 @@ Workers are tried in ascending priority order. The first successful result wins.
 
 ---
 
+## Logging
+
+MMI always writes a log file — no setup required.
+
+**Location:** `<Syllego project root>/logs/mmi.log`
+Rotates daily, keeps 30 days of history.
+
+**Example log output:**
+```
+2026-03-02 07:19:37 [mmi.router] INFO: [caller=Atlas] ingest: https://youtube.com/watch?v=...
+2026-03-02 07:19:37 [mmi.router] INFO: Trying YtdlpWorker for https://youtube.com/...
+2026-03-02 07:19:39 [mmi.router] INFO: [caller=Atlas] success via YtdlpWorker: /path/to/file.mp4
+
+2026-03-02 07:20:11 [mmi.router] INFO: [caller=Atlas] ingest: https://rumble.com/v123-title.html
+2026-03-02 07:20:11 [mmi.router] WARNING: RumbleWorker failed (403): HTTP Error 403
+2026-03-02 07:20:33 [mmi.router] INFO: [caller=Atlas] success via PlaywrightWorker: /path/to/file.mp4
+
+2026-03-02 07:21:00 [mmi.router] ERROR: [caller=Atlas] all workers failed for https://... — last error: (NO_STREAM_FOUND) ...
+```
+
+### Identifying your application in the logs
+
+Set `MMI_CALLER` once per process before importing mmi. The call signature of `ingest()` is unchanged.
+
+```python
+import os
+os.environ["MMI_CALLER"] = "Atlas"   # or "civic_media", "Facebook-Monitor", etc.
+
+import mmi   # file handler attaches here
+
+result = mmi.ingest(url)   # unchanged — no extra parameters
+```
+
+**In a venv app**, set it at the top of your entry point before any mmi import:
+```python
+# myapp/main.py
+import os
+os.environ["MMI_CALLER"] = "MyApp"
+
+from mmi import ingest   # logging configured at import time
+```
+
+The log file handler is attached exclusively to the `mmi.*` logger namespace. It does not touch the root logger, so it has zero effect on your application's own logging configuration.
+
+---
+
 ## Configuration
 
 All configuration is via environment variable or defaults — no config file needed.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MMI_OUTPUT_DIR` | `./downloads/` (relative to CWD) | Where files are saved |
+| `MMI_OUTPUT_DIR` | `./downloads/` (relative to CWD) | Where downloaded files are saved |
+| `MMI_CALLER` | `"unknown"` | Name tag written into log entries — set to your app's name |
 
-The debug directory (`MMI_OUTPUT_DIR/debug/`) and SQLite history DB (`MMI_OUTPUT_DIR/mmi_history.db`) are created automatically inside the output directory.
+The debug directory (`MMI_OUTPUT_DIR/debug/`), SQLite history DB (`MMI_OUTPUT_DIR/mmi_history.db`), and log directory (`<project>/logs/`) are created automatically.
 
 ### Override output directory in code
 

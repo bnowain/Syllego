@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mmi.config import MMI_OUTPUT_DIR, get_logger
+from mmi.config import MMI_CALLER, MMI_OUTPUT_DIR, get_logger
 from mmi.db import history as db
 from mmi.engine.base import BaseWorker, IngestionResult
 from mmi.reporting.reporter import write_failure_bundle
@@ -59,6 +59,7 @@ class Router:
         Auto-route URL to the highest-priority worker that can handle it.
         Records result in history DB; writes failure bundle on failure.
         """
+        logger.info("[caller=%s] ingest: %s", MMI_CALLER, url)
         workers = self._get_workers()
         tried = []
         for worker in workers:
@@ -74,7 +75,10 @@ class Router:
                     worker_name=result.worker_name,
                     filename=result.filename,
                 )
-                logger.info("Success via %s → %s", result.worker_name, result.filename)
+                logger.info(
+                    "[caller=%s] success via %s: %s",
+                    MMI_CALLER, result.worker_name, result.filename,
+                )
                 return result
             else:
                 logger.warning(
@@ -98,6 +102,10 @@ class Router:
             worker_name=last_result.worker_name,
             error_message=last_result.error_message,
         )
+        logger.error(
+            "[caller=%s] all workers failed for %s — last error: (%s) %s",
+            MMI_CALLER, url, last_result.error_code, last_result.error_message,
+        )
         write_failure_bundle(last_result)
         return last_result
 
@@ -105,7 +113,7 @@ class Router:
         """
         Manual m3u8 override — always uses CustomWorker regardless of URL.
         """
-        # Import here to avoid circular at module level
+        logger.info("[caller=%s] ingest_m3u8: %s (referer: %s)", MMI_CALLER, stream_url, referer)
         from mmi.engine.custom_worker import CustomWorker
         worker = CustomWorker()
         result = worker.safe_download_m3u8(stream_url, referer, self.output_dir)
@@ -118,7 +126,15 @@ class Router:
             error_message=result.error_message,
         )
         if not result.success:
+            logger.error(
+                "[caller=%s] ingest_m3u8 failed: (%s) %s",
+                MMI_CALLER, result.error_code, result.error_message,
+            )
             write_failure_bundle(result)
+        else:
+            logger.info(
+                "[caller=%s] ingest_m3u8 success: %s", MMI_CALLER, result.filename,
+            )
         return result
 
 

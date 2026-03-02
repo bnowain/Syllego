@@ -15,3 +15,5 @@ downloads/
 *.db-wal
 .browser_profile/
 mmi_live_test_output/
+logs/
+.coverage
