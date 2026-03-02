@@ -2,10 +2,9 @@
 rumble_stealth_worker.py — Stealth Tor+Playwright fallback for Rumble (priority 87).
 
 Handles: rumble.com, rmbl.ws
-Strategy: Tor-routed Playwright with full fingerprint spoofing via the Facebook-Monitor
-          stealth system. This is the last resort before GenericWorker — it kicks in
-          only when both yt-dlp (RumbleWorker) and plain headless Chromium
-          (PlaywrightWorker) have already failed.
+Strategy: Tor-routed Playwright with full fingerprint spoofing. This is the last
+          resort before GenericWorker — it kicks in only when both yt-dlp
+          (RumbleWorker) and plain headless Chromium (PlaywrightWorker) have failed.
 
 Why Tor? Cloudflare bans are IP-level. A fresh Tor exit node presents a different IP,
 bypassing the block even when the browser fingerprint alone is insufficient.
@@ -14,20 +13,21 @@ Falls in AFTER PlaywrightWorker (priority 85) and BEFORE GenericWorker (100).
 
 AI-MAINTENANCE NOTE:
   If Rumble's CDN domain changes, update _CDN_HINTS (keep in sync with playwright_worker.py).
-  If Facebook-Monitor moves, update _FB_MONITOR_DIR (same constant as facebook_worker.py).
+  Tor binary location: set MMI_TOR_BUNDLE_DIR env var (see mmi/tor_pool.py).
   Tor must be available: either already running on port 9050, or
-  tor.exe at Facebook-Monitor/tor-bundle/tor/tor.exe.
+  tor.exe must exist in the MMI_TOR_BUNDLE_DIR/tor/ directory.
 """
 from __future__ import annotations
 
 import socket
 import subprocess
-import sys
 import time
 import traceback
 from pathlib import Path
 from threading import Event
 
+from mmi import stealth as _stealth_mod
+from mmi import tor_pool as _tor_pool_mod
 from mmi.config import get_logger
 from mmi.engine.base import BaseWorker, IngestionResult
 from mmi.engine.custom_worker import _unique_path, _url_to_slug
@@ -48,8 +48,8 @@ _STREAM_PATTERNS = (".m3u8", ".mpd")
 
 _INTERCEPT_TIMEOUT_SEC = 30  # longer than PlaywrightWorker (20s) — Tor adds latency
 
-# Shared with facebook_worker.py — same stealth system
-_FB_MONITOR_DIR = Path("E:/0-Automated-Apps/Facebook-Monitor")
+# Tor config path — gracefully falls back to safe defaults if not found
+_FB_MONITOR_CONFIG = Path("E:/0-Automated-Apps/Facebook-Monitor/config.json")
 
 
 def _tor_is_running(host: str = "127.0.0.1", port: int = 9050) -> bool:
@@ -60,27 +60,11 @@ def _tor_is_running(host: str = "127.0.0.1", port: int = 9050) -> bool:
         return False
 
 
-def _import_stealth():
-    monitor_str = str(_FB_MONITOR_DIR)
-    if monitor_str not in sys.path:
-        sys.path.insert(0, monitor_str)
-    try:
-        import stealth as _stealth
-        import tor_pool as _tor_pool
-        return _stealth, _tor_pool
-    except ImportError as exc:
-        raise ImportError(
-            f"Facebook-Monitor stealth system not found at {_FB_MONITOR_DIR}. "
-            f"Original error: {exc}"
-        )
-
-
 def _load_fb_monitor_config() -> dict:
     import json
-    config_path = _FB_MONITOR_DIR / "config.json"
-    if config_path.exists():
+    if _FB_MONITOR_CONFIG.exists():
         try:
-            return json.loads(config_path.read_text(encoding="utf-8"))
+            return json.loads(_FB_MONITOR_CONFIG.read_text(encoding="utf-8"))
         except Exception:
             pass
     return {
@@ -116,21 +100,13 @@ class RumbleStealthWorker(BaseWorker):
         return any(host in url for host in _RUMBLE_HOSTS)
 
     def download(self, url: str, output_dir: Path) -> IngestionResult:
-        try:
-            stealth, tor_pool_mod = _import_stealth()
-        except ImportError as exc:
-            return IngestionResult(
-                success=False,
-                url=url,
-                worker_name=type(self).__name__,
-                error_code="STEALTH_NOT_AVAILABLE",
-                error_message=str(exc),
-            )
+        stealth = _stealth_mod
+        tor_pool_mod = _tor_pool_mod
 
         config = _load_fb_monitor_config()
 
         if not _tor_is_running():
-            logger.info("Tor not running, starting via Facebook-Monitor bundle...")
+            logger.info("Tor not running, starting via configured tor bundle...")
             try:
                 tor_pool_mod.ensure_main_tor(config)
                 _wait_for_tor(timeout=90)

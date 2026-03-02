@@ -1,12 +1,10 @@
 """
-facebook_worker.py — Stealth Facebook video download worker (priority 45).
+facebook_worker.py — Stealth Facebook video download worker (priority 35).
 
 Handles: facebook.com, fb.watch
 Strategy: Tor-routed Playwright with full fingerprint spoofing, seeded cookie
-          history, and human-like timing — using the stealth system built into
-          Facebook-Monitor. Each download gets a fresh Tor circuit + fresh
-          randomized browser profile, matching the one-request-per-identity
-          design of that system.
+          history, and human-like timing. Each download gets a fresh Tor circuit
+          + fresh randomized browser profile.
 
 Falls in BEFORE YtdlpWorker (priority 40) — stealth is the default path for all
 Facebook downloads. YtdlpWorker acts as fallback if stealth fails.
@@ -16,20 +14,21 @@ Falls back to any .mp4 URL on the page if fbcdn is not found.
 
 AI-MAINTENANCE NOTE:
   If Facebook changes its CDN domain, add it to _FB_CDN_HINTS.
-  If the Facebook-Monitor path moves, update _FB_MONITOR_DIR.
+  Tor binary location: set MMI_TOR_BUNDLE_DIR env var (see mmi/tor_pool.py).
   Tor must be available: either already running on port 9050, or
-  tor.exe must exist at Facebook-Monitor/tor-bundle/tor/tor.exe.
+  tor.exe must exist in the MMI_TOR_BUNDLE_DIR/tor/ directory.
 """
 from __future__ import annotations
 
 import socket
 import subprocess
-import sys
 import time
 import traceback
 from pathlib import Path
 from threading import Event
 
+from mmi import stealth as _stealth_mod
+from mmi import tor_pool as _tor_pool_mod
 from mmi.config import get_logger
 from mmi.engine.base import BaseWorker, IngestionResult
 from mmi.engine.custom_worker import _unique_path, _url_to_slug
@@ -51,8 +50,9 @@ _STREAM_PATTERNS = (".m3u8", ".mpd")
 # How long to wait for the video player to fire its CDN request
 _INTERCEPT_TIMEOUT_SEC = 25
 
-# Facebook-Monitor project path — stealth + tor_pool live here
-_FB_MONITOR_DIR = Path("E:/0-Automated-Apps/Facebook-Monitor")
+# Facebook-Monitor config path — Tor settings (socks_port, control_port, etc.)
+# Gracefully falls back to safe defaults if not found.
+_FB_MONITOR_CONFIG = Path("E:/0-Automated-Apps/Facebook-Monitor/config.json")
 
 
 def _tor_is_running(host: str = "127.0.0.1", port: int = 9050) -> bool:
@@ -62,26 +62,6 @@ def _tor_is_running(host: str = "127.0.0.1", port: int = 9050) -> bool:
             return True
     except OSError:
         return False
-
-
-def _import_stealth():
-    """
-    Import Facebook-Monitor's stealth module.
-    Inserts the project dir into sys.path temporarily.
-    Returns the stealth module, or raises ImportError if not found.
-    """
-    monitor_str = str(_FB_MONITOR_DIR)
-    if monitor_str not in sys.path:
-        sys.path.insert(0, monitor_str)
-    try:
-        import stealth as _stealth
-        import tor_pool as _tor_pool
-        return _stealth, _tor_pool
-    except ImportError as exc:
-        raise ImportError(
-            f"Facebook-Monitor stealth system not found at {_FB_MONITOR_DIR}. "
-            f"Original error: {exc}"
-        )
 
 
 class FacebookWorker(BaseWorker):
@@ -96,24 +76,16 @@ class FacebookWorker(BaseWorker):
         return any(host in url for host in _FACEBOOK_HOSTS)
 
     def download(self, url: str, output_dir: Path) -> IngestionResult:
-        try:
-            stealth, tor_pool_mod = _import_stealth()
-        except ImportError as exc:
-            return IngestionResult(
-                success=False,
-                url=url,
-                worker_name=type(self).__name__,
-                error_code="STEALTH_NOT_AVAILABLE",
-                error_message=str(exc),
-            )
+        stealth = _stealth_mod
+        tor_pool_mod = _tor_pool_mod
 
-        # Load Facebook-Monitor config for Tor settings
+        # Load Tor settings (falls back to safe defaults if config not found)
         config = _load_fb_monitor_config()
 
         # Ensure Tor is running — reuse if already up, start if not
         tor_proc = None
         if not _tor_is_running():
-            logger.info("Tor not running, starting via Facebook-Monitor bundle...")
+            logger.info("Tor not running, starting via configured tor bundle...")
             try:
                 tor_proc = tor_pool_mod.ensure_main_tor(config)
                 # Wait for bootstrap
@@ -344,9 +316,9 @@ class FacebookWorker(BaseWorker):
 # ------------------------------------------------------------------
 
 def _load_fb_monitor_config() -> dict:
-    """Load Facebook-Monitor's config.json, or return safe defaults."""
+    """Load Tor config from Facebook-Monitor's config.json, or return safe defaults."""
     import json
-    config_path = _FB_MONITOR_DIR / "config.json"
+    config_path = _FB_MONITOR_CONFIG
     if config_path.exists():
         try:
             return json.loads(config_path.read_text(encoding="utf-8"))
