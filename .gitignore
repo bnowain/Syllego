@@ -13,3 +13,5 @@ downloads/
 *.db
 *.db-shm
 *.db-wal
+.browser_profile/
+mmi_live_test_output/

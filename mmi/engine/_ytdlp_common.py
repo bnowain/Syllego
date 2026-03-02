@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 import traceback
 from pathlib import Path
 
@@ -47,7 +48,7 @@ def run_ytdlp(
     output_template = str(output_dir / "%(title)s.%(ext)s")
 
     cmd = [
-        "yt-dlp",
+        sys.executable, "-m", "yt_dlp",
         "--user-agent", CHROME_USER_AGENT,
         "--output", output_template,
         "--no-playlist",
@@ -74,7 +75,7 @@ def run_ytdlp(
             url=url,
             worker_name=worker_name,
             error_code="YTDLP_NOT_FOUND",
-            error_message="yt-dlp executable not found. Install with: pip install yt-dlp",
+            error_message="yt-dlp not found. Install with: pip install yt-dlp",
         )
     except Exception as exc:  # noqa: BLE001
         return IngestionResult(

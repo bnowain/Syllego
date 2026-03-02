@@ -5,6 +5,7 @@ Usage:
   mmi <url>                              Auto-route to best worker
   mmi --m3u8 <stream> --referer <page>  Manual m3u8 stream download
   mmi --history                          Show recent downloads
+  mmi --harvest-cookies                  Run Playwright cookie harvester
   mmi -o /path/to/dir <url>             Override output directory
   mmi -v <url>                           Verbose/debug logging
   mmi --version                          Print version and exit
@@ -29,6 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--m3u8", metavar="STREAM_URL", help="HLS m3u8 stream URL (manual override)")
     p.add_argument("--referer", metavar="PAGE_URL", help="Referer page URL (required with --m3u8)")
     p.add_argument("--history", action="store_true", help="Show recent download history")
+    p.add_argument("--harvest-cookies", action="store_true", help="Run Playwright cookie harvester (helps with Rumble etc.)")
     p.add_argument("-o", "--output", metavar="DIR", help="Output directory (default: ./downloads)")
     p.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     p.add_argument("--version", action="version", version=f"mmi {_VERSION}")
@@ -37,6 +39,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     parser = build_parser()
+    # Ensure stdout/stderr handle Unicode on Windows (filenames can contain emoji/CJK)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     args = parser.parse_args()
 
     logger = get_logger("mmi.cli", verbose=args.verbose)
@@ -47,6 +55,13 @@ def main() -> None:
     # --history
     if args.history:
         _show_history()
+        return
+
+    # --harvest-cookies
+    if args.harvest_cookies:
+        from mmi.cookie_harvest import harvest_cookies
+        cookies_path = harvest_cookies()
+        print(f"Cookies saved: {cookies_path}")
         return
 
     # --m3u8 path

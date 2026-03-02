@@ -139,9 +139,12 @@ def _all_subclasses(cls: type) -> list[type]:
 def _import_workers() -> None:
     """Import all worker modules so their classes register as BaseWorker subclasses."""
     # Order here doesn't matter — priority int determines dispatch order
-    import mmi.engine.rumble_worker    # noqa: F401
-    import mmi.engine.odysee_worker    # noqa: F401
-    import mmi.engine.gallery_worker   # noqa: F401
-    import mmi.engine.ytdlp_worker     # noqa: F401
-    import mmi.engine.generic_worker   # noqa: F401
+    import mmi.engine.rumble_worker      # noqa: F401
+    import mmi.engine.odysee_worker     # noqa: F401
+    import mmi.engine.gallery_worker    # noqa: F401
+    import mmi.engine.ytdlp_worker      # noqa: F401
+    import mmi.engine.facebook_worker   # noqa: F401
+    import mmi.engine.playwright_worker        # noqa: F401
+    import mmi.engine.rumble_stealth_worker   # noqa: F401
+    import mmi.engine.generic_worker          # noqa: F401
     # CustomWorker is NOT imported here — it's never auto-routed

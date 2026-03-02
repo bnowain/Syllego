@@ -1,0 +1,375 @@
+"""
+facebook_worker.py — Stealth Facebook video download worker (priority 45).
+
+Handles: facebook.com, fb.watch
+Strategy: Tor-routed Playwright with full fingerprint spoofing, seeded cookie
+          history, and human-like timing — using the stealth system built into
+          Facebook-Monitor. Each download gets a fresh Tor circuit + fresh
+          randomized browser profile, matching the one-request-per-identity
+          design of that system.
+
+Falls in BEFORE YtdlpWorker (priority 40) — stealth is the default path for all
+Facebook downloads. YtdlpWorker acts as fallback if stealth fails.
+
+Intercepted CDN pattern: *.fbcdn.net (Facebook's video delivery network).
+Falls back to any .mp4 URL on the page if fbcdn is not found.
+
+AI-MAINTENANCE NOTE:
+  If Facebook changes its CDN domain, add it to _FB_CDN_HINTS.
+  If the Facebook-Monitor path moves, update _FB_MONITOR_DIR.
+  Tor must be available: either already running on port 9050, or
+  tor.exe must exist at Facebook-Monitor/tor-bundle/tor/tor.exe.
+"""
+from __future__ import annotations
+
+import socket
+import subprocess
+import sys
+import time
+import traceback
+from pathlib import Path
+from threading import Event
+
+from mmi.config import get_logger
+from mmi.engine.base import BaseWorker, IngestionResult
+from mmi.engine.custom_worker import _unique_path, _url_to_slug
+
+logger = get_logger("mmi.facebook")
+
+_FACEBOOK_HOSTS = ("facebook.com", "fb.watch")
+
+# Facebook's video CDN — intercept any request to these domains
+_FB_CDN_HINTS = (
+    "fbcdn.net",
+    "video.xx.fbcdn.net",
+    "video-",       # Facebook video segment prefix pattern
+)
+
+# Stream manifest patterns
+_STREAM_PATTERNS = (".m3u8", ".mpd")
+
+# How long to wait for the video player to fire its CDN request
+_INTERCEPT_TIMEOUT_SEC = 25
+
+# Facebook-Monitor project path — stealth + tor_pool live here
+_FB_MONITOR_DIR = Path("E:/0-Automated-Apps/Facebook-Monitor")
+
+
+def _tor_is_running(host: str = "127.0.0.1", port: int = 9050) -> bool:
+    """Check if a Tor SOCKS proxy is already accepting connections."""
+    try:
+        with socket.create_connection((host, port), timeout=3):
+            return True
+    except OSError:
+        return False
+
+
+def _import_stealth():
+    """
+    Import Facebook-Monitor's stealth module.
+    Inserts the project dir into sys.path temporarily.
+    Returns the stealth module, or raises ImportError if not found.
+    """
+    monitor_str = str(_FB_MONITOR_DIR)
+    if monitor_str not in sys.path:
+        sys.path.insert(0, monitor_str)
+    try:
+        import stealth as _stealth
+        import tor_pool as _tor_pool
+        return _stealth, _tor_pool
+    except ImportError as exc:
+        raise ImportError(
+            f"Facebook-Monitor stealth system not found at {_FB_MONITOR_DIR}. "
+            f"Original error: {exc}"
+        )
+
+
+class FacebookWorker(BaseWorker):
+    """
+    Stealth Facebook video worker.
+    Routes through Tor, uses a fresh randomized browser fingerprint per download.
+    """
+
+    priority = 35  # Before YtdlpWorker (40) — stealth is the default Facebook path
+
+    def can_handle(self, url: str) -> bool:
+        return any(host in url for host in _FACEBOOK_HOSTS)
+
+    def download(self, url: str, output_dir: Path) -> IngestionResult:
+        try:
+            stealth, tor_pool_mod = _import_stealth()
+        except ImportError as exc:
+            return IngestionResult(
+                success=False,
+                url=url,
+                worker_name=type(self).__name__,
+                error_code="STEALTH_NOT_AVAILABLE",
+                error_message=str(exc),
+            )
+
+        # Load Facebook-Monitor config for Tor settings
+        config = _load_fb_monitor_config()
+
+        # Ensure Tor is running — reuse if already up, start if not
+        tor_proc = None
+        if not _tor_is_running():
+            logger.info("Tor not running, starting via Facebook-Monitor bundle...")
+            try:
+                tor_proc = tor_pool_mod.ensure_main_tor(config)
+                # Wait for bootstrap
+                _wait_for_tor(timeout=90)
+            except Exception as exc:
+                return IngestionResult(
+                    success=False,
+                    url=url,
+                    worker_name=type(self).__name__,
+                    error_code="TOR_START_FAILED",
+                    error_message=str(exc),
+                    stack_trace=traceback.format_exc(),
+                )
+        else:
+            logger.info("Tor already running on port 9050, reusing")
+
+        # Renew circuit — fresh exit node for this request
+        try:
+            stealth.renew_tor_circuit(config)
+            logger.debug("Tor circuit renewed")
+        except Exception as exc:
+            logger.warning("Circuit renewal failed (continuing anyway): %s", exc)
+
+        # Intercept video URL via stealth browser
+        try:
+            stream_url, stream_type = self._intercept_with_stealth(url, stealth, config)
+        except Exception as exc:
+            return IngestionResult(
+                success=False,
+                url=url,
+                worker_name=type(self).__name__,
+                error_code="STEALTH_BROWSE_FAILED",
+                error_message=str(exc),
+                stack_trace=traceback.format_exc(),
+            )
+
+        if not stream_url:
+            return IngestionResult(
+                success=False,
+                url=url,
+                worker_name=type(self).__name__,
+                error_code="NO_STREAM_FOUND",
+                error_message=(
+                    f"Stealth browser opened the page but no Facebook video CDN "
+                    f"request was intercepted within {_INTERCEPT_TIMEOUT_SEC}s."
+                ),
+            )
+
+        logger.info("Intercepted %s: %s", stream_type, stream_url[:80])
+
+        if stream_type == "m3u8":
+            return self._download_m3u8(stream_url, referer=url, output_dir=output_dir)
+        else:
+            return self._download_direct(stream_url, referer=url, output_dir=output_dir)
+
+    # ------------------------------------------------------------------
+    # Stealth browser interception
+    # ------------------------------------------------------------------
+
+    def _intercept_with_stealth(
+        self, url: str, stealth, config: dict
+    ) -> tuple[str | None, str | None]:
+        """
+        Open url in a stealth Tor-routed Chromium, intercept the video CDN request.
+        Each call = fresh browser profile + fresh Tor circuit.
+        """
+        from playwright.sync_api import sync_playwright
+
+        found: dict = {}
+        done = Event()
+
+        def on_request(request):
+            if done.is_set():
+                return
+            req_url = request.url
+            # HLS/DASH manifest
+            for pat in _STREAM_PATTERNS:
+                if pat in req_url:
+                    found["url"] = req_url
+                    found["type"] = "m3u8"
+                    done.set()
+                    return
+            # Facebook CDN direct video
+            if ".mp4" in req_url and any(hint in req_url for hint in _FB_CDN_HINTS):
+                found["url"] = req_url
+                found["type"] = "direct"
+                done.set()
+
+        proxy = stealth.get_tor_proxy(config)
+
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                proxy=proxy,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--autoplay-policy=no-user-gesture-required",
+                ],
+            )
+
+            # Fresh randomized fingerprint — new identity per request
+            context = stealth.create_stealth_context(
+                browser, config, proxy_override=proxy
+            )
+            stealth.seed_browser_history(context)
+
+            page = context.new_page()
+            page.on("request", on_request)
+
+            # Warm up first (builds referrer chain, looks human)
+            logger.debug("Warming up browser before Facebook navigation...")
+            try:
+                stealth.warm_up_browser(page)
+            except Exception as exc:
+                logger.debug("Warm-up partial error (continuing): %s", exc)
+
+            # Navigate to Facebook with human-like timing
+            logger.debug("Navigating to %s", url)
+            try:
+                stealth.stealth_goto(page, url)
+            except Exception as exc:
+                logger.debug("stealth_goto partial error (continuing): %s", exc)
+
+            # Trigger video autoplay
+            try:
+                page.evaluate("""
+                    const videos = document.querySelectorAll('video');
+                    videos.forEach(v => { v.muted = true; v.play().catch(() => {}); });
+                    // Also click any play buttons
+                    const playBtns = document.querySelectorAll('[data-testid="UFI2ReactionsCount/root"], [aria-label="Play"]');
+                    playBtns.forEach(b => b.click());
+                """)
+            except Exception:
+                pass
+
+            done.wait(timeout=_INTERCEPT_TIMEOUT_SEC)
+
+            page.close()
+            context.close()
+            browser.close()
+
+        return found.get("url"), found.get("type")
+
+    # ------------------------------------------------------------------
+    # Download helpers
+    # ------------------------------------------------------------------
+
+    def _download_m3u8(self, stream_url: str, referer: str, output_dir: Path) -> IngestionResult:
+        from mmi.config import CHROME_USER_AGENT
+        output_dir.mkdir(parents=True, exist_ok=True)
+        slug = _url_to_slug(referer) or "facebook_video"
+        output_file = _unique_path(output_dir / f"{slug}.mp4")
+
+        headers = f"Referer: {referer}\r\nUser-Agent: {CHROME_USER_AGENT}\r\n"
+        cmd = [
+            "ffmpeg", "-headers", headers,
+            "-i", stream_url,
+            "-c", "copy", "-bsf:a", "aac_adtstoasc",
+            str(output_file), "-y",
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+            )
+        except FileNotFoundError:
+            return IngestionResult(
+                success=False, url=referer, worker_name=type(self).__name__,
+                error_code="FFMPEG_NOT_FOUND",
+                error_message="ffmpeg not found. Install from https://ffmpeg.org/download.html",
+            )
+        except Exception as exc:
+            return IngestionResult(
+                success=False, url=referer, worker_name=type(self).__name__,
+                error_code="SUBPROCESS_ERROR", error_message=str(exc),
+                stack_trace=traceback.format_exc(),
+            )
+
+        if result.returncode != 0:
+            return IngestionResult(
+                success=False, url=referer, worker_name=type(self).__name__,
+                error_code=str(result.returncode),
+                error_message=result.stderr[-2000:] if result.stderr else "ffmpeg failed",
+            )
+        return IngestionResult(
+            success=True, url=referer, worker_name=type(self).__name__,
+            filename=str(output_file),
+            metadata={"stream_url": stream_url},
+        )
+
+    def _download_direct(self, stream_url: str, referer: str, output_dir: Path) -> IngestionResult:
+        import httpx
+        from urllib.parse import urlparse
+        from mmi.config import CHROME_USER_AGENT
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        parsed = urlparse(stream_url)
+        filename = parsed.path.split("/")[-1].split("?")[0] or "facebook_video.mp4"
+        if "." not in filename:
+            filename += ".mp4"
+        output_file = _unique_path(output_dir / filename)
+
+        try:
+            headers = {"User-Agent": CHROME_USER_AGENT, "Referer": referer}
+            with httpx.stream(
+                "GET", stream_url, headers=headers, follow_redirects=True, timeout=120
+            ) as resp:
+                resp.raise_for_status()
+                with open(output_file, "wb") as f:
+                    for chunk in resp.iter_bytes(chunk_size=65536):
+                        f.write(chunk)
+        except Exception as exc:
+            return IngestionResult(
+                success=False, url=referer, worker_name=type(self).__name__,
+                error_code="DIRECT_DOWNLOAD_FAILED", error_message=str(exc),
+                stack_trace=traceback.format_exc(),
+            )
+        return IngestionResult(
+            success=True, url=referer, worker_name=type(self).__name__,
+            filename=str(output_file),
+            metadata={"stream_url": stream_url},
+        )
+
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+
+def _load_fb_monitor_config() -> dict:
+    """Load Facebook-Monitor's config.json, or return safe defaults."""
+    import json
+    config_path = _FB_MONITOR_DIR / "config.json"
+    if config_path.exists():
+        try:
+            return json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    # Minimal defaults if config.json is missing
+    return {
+        "tor": {
+            "enabled": True,
+            "socks_port": 9050,
+            "control_port": 9051,
+            "control_password": "",
+        }
+    }
+
+
+def _wait_for_tor(timeout: int = 90) -> bool:
+    """Poll until Tor SOCKS port accepts connections, or timeout."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _tor_is_running():
+            logger.info("Tor bootstrap complete")
+            return True
+        time.sleep(3)
+    logger.warning("Tor did not bootstrap within %ds", timeout)
+    return False
