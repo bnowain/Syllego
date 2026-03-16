@@ -12,6 +12,10 @@ Facebook downloads. YtdlpWorker acts as fallback if stealth fails.
 Intercepted CDN pattern: *.fbcdn.net (Facebook's video delivery network).
 Falls back to any .mp4 URL on the page if fbcdn is not found.
 
+Instagram fallback: FB Shorts that originate from Instagram won't expose a CDN
+stream. When no stream is intercepted, the worker scrapes the page for Instagram
+reel/post URLs and re-ingests via mmi.ingest() (routes to GalleryWorker).
+
 AI-MAINTENANCE NOTE:
   If Facebook changes its CDN domain, add it to _FB_CDN_HINTS.
   Tor binary location: set MMI_TOR_BUNDLE_DIR env var (see mmi/tor_pool.py).
@@ -20,6 +24,7 @@ AI-MAINTENANCE NOTE:
 """
 from __future__ import annotations
 
+import re
 import socket
 import subprocess
 import time
@@ -42,6 +47,11 @@ _FB_CDN_HINTS = (
     "fbcdn.net",
     "video.xx.fbcdn.net",
     "video-",       # Facebook video segment prefix pattern
+)
+
+# Regex to find Instagram reel/post URLs in page content
+_INSTAGRAM_URL_RE = re.compile(
+    r'https?://(?:www\.)?instagram\.com/(?:reel|p|reels)/[A-Za-z0-9_-]+/?',
 )
 
 # Stream manifest patterns
@@ -111,7 +121,9 @@ class FacebookWorker(BaseWorker):
 
         # Intercept video URL via stealth browser
         try:
-            stream_url, stream_type = self._intercept_with_stealth(url, stealth, config)
+            stream_url, stream_type, instagram_url = self._intercept_with_stealth(
+                url, stealth, config
+            )
         except Exception as exc:
             return IngestionResult(
                 success=False,
@@ -123,6 +135,37 @@ class FacebookWorker(BaseWorker):
             )
 
         if not stream_url:
+            # ── Instagram fallback ────────────────────────────────────────
+            # FB Shorts shared from Instagram won't expose a CDN stream.
+            # If we found an Instagram URL on the page, re-ingest via MMI
+            # which routes to GalleryWorker (gallery-dl) for Instagram.
+            if instagram_url:
+                logger.info(
+                    "No FB stream found — detected Instagram origin: %s → %s",
+                    url, instagram_url,
+                )
+                try:
+                    import mmi
+                    ig_result = mmi.ingest(instagram_url, output_dir=output_dir)
+                    if ig_result.success:
+                        logger.info(
+                            "Instagram fallback succeeded via %s",
+                            ig_result.worker_name,
+                        )
+                        # Preserve the original FB URL in metadata
+                        ig_result.metadata = ig_result.metadata or {}
+                        ig_result.metadata["original_facebook_url"] = url
+                        ig_result.metadata["instagram_fallback"] = True
+                        ig_result.worker_name = f"{type(self).__name__}→{ig_result.worker_name}"
+                        return ig_result
+                    else:
+                        logger.warning(
+                            "Instagram fallback also failed: %s — %s",
+                            ig_result.error_code, ig_result.error_message,
+                        )
+                except Exception as exc:
+                    logger.warning("Instagram fallback raised: %s", exc)
+
             return IngestionResult(
                 success=False,
                 url=url,
@@ -131,6 +174,8 @@ class FacebookWorker(BaseWorker):
                 error_message=(
                     f"Stealth browser opened the page but no Facebook video CDN "
                     f"request was intercepted within {_INTERCEPT_TIMEOUT_SEC}s."
+                    + (f" Instagram URL detected ({instagram_url}) but fallback "
+                       f"download also failed." if instagram_url else "")
                 ),
             )
 
@@ -147,10 +192,16 @@ class FacebookWorker(BaseWorker):
 
     def _intercept_with_stealth(
         self, url: str, stealth, config: dict
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[str | None, str | None, str | None]:
         """
         Open url in a stealth Tor-routed Chromium, intercept the video CDN request.
         Each call = fresh browser profile + fresh Tor circuit.
+
+        Returns:
+            (stream_url, stream_type, instagram_url)
+            - stream_url/stream_type are set when a Facebook CDN video is found
+            - instagram_url is set when no stream is found but the page references
+              an Instagram reel/post (FB Shorts shared from Instagram)
         """
         from playwright.sync_api import sync_playwright
 
@@ -224,11 +275,63 @@ class FacebookWorker(BaseWorker):
 
             done.wait(timeout=_INTERCEPT_TIMEOUT_SEC)
 
+            # If no stream found, check if this is an Instagram reel shared to FB
+            instagram_url = None
+            if not found.get("url"):
+                instagram_url = self._detect_instagram_url(page)
+
             page.close()
             context.close()
             browser.close()
 
-        return found.get("url"), found.get("type")
+        return found.get("url"), found.get("type"), instagram_url
+
+    def _detect_instagram_url(self, page) -> str | None:
+        """
+        Scrape the current FB page for Instagram reel/post URLs.
+
+        FB Shorts that originate from Instagram often contain a link or
+        attribution back to the original Instagram post. This method checks:
+          1. All <a> href attributes on the page
+          2. Page HTML source for instagram.com/reel/ or /p/ patterns
+          3. Meta tags (og:url, og:see_also) that reference Instagram
+        """
+        try:
+            # Strategy 1: Check all links on the page
+            hrefs = page.evaluate("""
+                Array.from(document.querySelectorAll('a[href]'))
+                    .map(a => a.href)
+                    .filter(h => h.includes('instagram.com'))
+            """)
+            for href in (hrefs or []):
+                match = _INSTAGRAM_URL_RE.search(href)
+                if match:
+                    logger.info("Found Instagram link in page <a> tags: %s", match.group(0))
+                    return match.group(0)
+
+            # Strategy 2: Check meta tags
+            meta_urls = page.evaluate("""
+                Array.from(document.querySelectorAll('meta[content]'))
+                    .map(m => m.content)
+                    .filter(c => c.includes('instagram.com'))
+            """)
+            for content in (meta_urls or []):
+                match = _INSTAGRAM_URL_RE.search(content)
+                if match:
+                    logger.info("Found Instagram URL in meta tags: %s", match.group(0))
+                    return match.group(0)
+
+            # Strategy 3: Search full page HTML as last resort
+            html = page.content()
+            match = _INSTAGRAM_URL_RE.search(html)
+            if match:
+                logger.info("Found Instagram URL in page HTML: %s", match.group(0))
+                return match.group(0)
+
+        except Exception as exc:
+            logger.debug("Instagram URL detection failed: %s", exc)
+
+        return None
 
     # ------------------------------------------------------------------
     # Download helpers

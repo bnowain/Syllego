@@ -40,12 +40,20 @@ log = logging.getLogger("mmi.tor_pool")
 # TOR_BUNDLE_DIR: directory containing tor/tor.exe, torrc, and tor-data/.
 # Override with MMI_TOR_BUNDLE_DIR env var when the Tor binary lives somewhere
 # other than the default Facebook-Monitor location.
-TOR_BUNDLE_DIR = Path(
-    os.environ.get(
-        "MMI_TOR_BUNDLE_DIR",
-        "E:/0-Automated-Apps/Facebook-Monitor/tor-bundle",
-    )
-)
+_DEFAULT_BUNDLE_WIN = "E:/0-Automated-Apps/Facebook-Monitor/tor-bundle"
+_DEFAULT_BUNDLE_WSL = "/mnt/e/0-Automated-Apps/Facebook-Monitor/tor-bundle"
+
+def _resolve_bundle_dir() -> Path:
+    """Pick the Tor bundle path that exists on this platform."""
+    env = os.environ.get("MMI_TOR_BUNDLE_DIR")
+    if env:
+        return Path(env)
+    wsl = Path(_DEFAULT_BUNDLE_WSL)
+    if wsl.exists():
+        return wsl
+    return Path(_DEFAULT_BUNDLE_WIN)
+
+TOR_BUNDLE_DIR = _resolve_bundle_dir()
 BASE_DIR = TOR_BUNDLE_DIR  # kept for internal compatibility
 TORRC_TEMPLATE = TOR_BUNDLE_DIR / "torrc"
 POOL_DATA_DIR = TOR_BUNDLE_DIR / "tor-data-pool"
